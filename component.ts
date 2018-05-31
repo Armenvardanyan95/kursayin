@@ -16,14 +16,22 @@ function setPropValue(propertyWithPrefixes: string, target, value: any): void {
     upperMostNestedObject[propArray[propArray.length - 1]] = value;
 }
 
-function proxify(o, changeDetector) {
-    function buildProxy(prefix, o) {
-        return new Proxy(o, {
-            set: function(target, propertyName, value) {
+interface Changes {
+    [key: string]: {previousValue: any, currentValue: any}
+}
+
+interface Target extends Object {
+    onComponentChanges?: (changes: Changes) => void;
+}
+
+function proxify(object: Target, changeDetector: BehaviorSubject<Changes>) {
+    function buildProxy(prefix: string, obj: Target) {
+        return new Proxy(obj, {
+            set: function(target: Target, propertyName: string, value: any) {
                 // same as before, but add prefix
                 console.log(`${prefix}${propertyName} has been changed from ${target[propertyName]} to ${value}`);
                 if (target[propertyName] !== value) {
-                    const changes = {[prefix + propertyName]: {previousValue: target[propertyName], currentValue: value}};
+                    const changes: Changes = {[prefix + propertyName]: {previousValue: target[propertyName], currentValue: value}};
                     if (changeDetector) changeDetector.next(changes);
                     if (target.onComponentChanges && typeof target.onComponentChanges === 'function') {
                         setTimeout(() => target.onComponentChanges(changes));
@@ -48,7 +56,7 @@ function proxify(o, changeDetector) {
         });
     }
 
-    return buildProxy('', o);
+    return buildProxy('', object);
 }
 
 interface VirtualDOM {
@@ -121,66 +129,108 @@ class Module {
         this.renderNodeList(rootComponent.__virtualDom, rootElement, rootComponent);
     }
 
+    private isComponent(node: VirtualDOM): boolean {
+        return node.tagName.toLowerCase() in this.componentSelectorMapping;
+    }
+
+    private isTextNode(node: VirtualDOM): boolean {
+        return node.tagName === '#text';
+    }
+
+    private isEventBinding(attrName: string): boolean {
+        return attrName.startsWith('on-');
+    }
+
+    private isBinding(attrName: string): boolean {
+        return attrName.startsWith('bind-');
+    }
+
+    private isModelBinding(attrName: string): boolean {
+        return attrName == 'bind-model';
+    }
+
+    private renderTextNode(node: VirtualDOM, parent: HTMLElement): void {
+        const text = document.createTextNode(node.content);
+        parent.appendChild(text);
+    }
+
+    private renderComponent(node: VirtualDOM, parent: HTMLElement): void {
+        const container = document.createElement(node.tagName);
+        parent.appendChild(container);
+        const componentClass = this.componentSelectorMapping[node.tagName.toLowerCase()];
+        this.renderNodeList(componentClass.__virtualDom, container, componentClass);
+    }
+
+    private bindModel(node: VirtualDOM, element: HTMLInputElement, componentInstance, attrName: string) {
+        if (node.tagName !== 'input') {
+            throw TypeError('You can only bind a model to an input element');
+        }
+        const bindingName: string = node.attributes[attrName];
+        element.value = getPropValue(bindingName, componentInstance);
+        componentInstance.__changeDetector
+            .filter(changes => changes && changes[bindingName])
+            .subscribe((changes) => element.value = changes[bindingName].currentValue);
+
+        Rx.Observable
+            .fromEvent(element, 'input')
+            .subscribe(() => setPropValue(bindingName, componentInstance, element.value));
+    }
+
+    private bindAttribute(node: VirtualDOM, element: HTMLElement, componentInstance, attrName: string) {
+        const finalAttrName: string = attrName.slice(5, attrName.length);
+        const bindingName = node.attributes[attrName];
+        const attrValue = getPropValue(bindingName, componentInstance);
+        element[finalAttrName] = attrValue;
+        componentInstance.__changeDetector
+            .filter(changes => changes && changes[bindingName])
+            .subscribe(changes => element[finalAttrName] = changes[bindingName].currentValue);
+    }
+
+    private renderElement(node: VirtualDOM, componentInstance, parent: HTMLElement, componentClass): void {
+        const element = document.createElement(node.tagName);
+        for (const attrName in node.attributes) {
+            if (this.isEventBinding(attrName)) {
+                this.bindEvent(attrName, node, element, componentInstance);
+            } else if (node.attributes.hasOwnProperty(attrName)) {
+                if (this.isModelBinding(attrName)) {
+                    this.bindModel(node, <HTMLInputElement>element, componentInstance, attrName);
+                }
+                if (this.isBinding(attrName)) {
+                    this.bindAttribute(node, element, componentInstance, attrName);
+                } else {
+                    element[attrName + (attrName === 'class' ? 'Name' : '')] = node.attributes[attrName];
+                }
+            }
+        }
+        this.renderNodeList(node.children, element, componentClass);
+        parent.appendChild(element);
+    }
+
+    private bindEvent(attrName: string, node: VirtualDOM, element: HTMLElement, componentInstance): void {
+        const eventName: string = attrName.slice(3, attrName.length);
+        const methodNameEndIndex = node.attributes[attrName].lastIndexOf('(');
+        const methodName = node.attributes[attrName].slice(0, methodNameEndIndex);
+        Rx.Observable.fromEvent(element, eventName).subscribe(event => componentInstance[methodName]())
+    }
+
     private renderNodeList(nodeList: any, parent: HTMLElement, component: any) {
         const componentInstance = new component();
         for (const node of nodeList) {
-            if (node.tagName.toLowerCase() in this.componentSelectorMapping) {
-                const container = document.createElement(node.tagName);
-                parent.appendChild(container);
-                const componentClass = this.componentSelectorMapping[node.tagName.toLowerCase()];
-                this.renderNodeList(componentClass.__virtualDom, container, componentClass);
-            } else if (node.tagName === '#text') {
-                const text = document.createTextNode(node.content);
-                parent.appendChild(text);
+            if (this.isComponent(node)) {
+                this.renderComponent(node, parent);
+            } else if (this.isTextNode(node)) {
+                this.renderTextNode(node, parent);
             } else {
-                const element = document.createElement(node.tagName);
-                for (const attrName in node.attributes) {
-                    if (attrName.startsWith('on-')) {
-                        const eventName: string = attrName.slice(3, attrName.length);
-                        const methodNameEndIndex = node.attributes[attrName].lastIndexOf('(');
-                        const methodName = node.attributes[attrName].slice(0, methodNameEndIndex);
-                        Rx.Observable.fromEvent(element, eventName).subscribe(event => componentInstance[methodName]())
-                    } else if (node.attributes.hasOwnProperty(attrName)) {
-                        let finalAttrName: string;
-                        if (attrName === 'bind-model') {
-                            if (node.tagName !== 'input') {
-                                throw TypeError('You can only bind a model to an input element');
-                            }
-                            const bindingName: string = node.attributes[attrName];
-                            element.value = getPropValue(bindingName, componentInstance);
-                            componentInstance.__changeDetector
-                                .filter(changes => changes && changes[bindingName])
-                                .subscribe((changes) => element.value = changes[bindingName].currentValue);
-
-                            Rx.Observable
-                                .fromEvent(element, 'input')
-                                .subscribe(() => setPropValue(bindingName, componentInstance, element.value));
-                        }
-                        if (attrName.startsWith('bind-')) {
-                            finalAttrName = attrName.slice(5, attrName.length);
-                            const bindingName = node.attributes[attrName];
-                            const attrValue = getPropValue(bindingName, componentInstance);
-                            element[finalAttrName] = attrValue;
-                            componentInstance.__changeDetector
-                                .filter(changes => changes && changes[bindingName])
-                                .subscribe(changes => element[finalAttrName] = changes[bindingName].currentValue);
-                        } else {
-                            element[attrName + (attrName === 'class' ? 'Name' : '')] = node.attributes[attrName];
-                        }
-                    }
-                }
-                this.renderNodeList(node.children, element, component);
-                parent.appendChild(element);
+                this.renderElement(node, componentInstance, parent, component)
             }
         }
     }
 }
 
 @Component({
-    template: `<div class="alert" style="background-color: aqua">
+    template: `<div style="background-color: aqua">
                 <button on-click="changeContent()">Click me!</button>
-                    Hello <input type="text" bind-model="hello"/>
-                    <span bind-innerText="user.name">Hover me</span>
+                    <span bind-innerText="hello"></span> <input type="text" bind-model="hello"/>
                     <nested></nested>
                     <nested></nested>
                     <nested></nested>
@@ -188,47 +238,21 @@ class Module {
                     <nested></nested>
                 <span bind-hidden="isButtonInVisible">I am togglable!</span>
             </div>`,
-    selector: 'greeter'
+    selector: 'root'
 })
-class Greeter {
-    property: string = "property";
-    hello: string = 'Private';
+class RootComponent {
+    hello: string = 'Hello!';
     isButtonInVisible: boolean = false;
-    impedimenta: number[] = [];
-    user = {name: 'Armen'};
-    nestedObject = {name: 'Armen', anotherNested: {nested: 'privet'}};
-
-    onComponentChanges(changes) {
-        console.log(changes);
-    }
-
-    @Watch('hello')
-    onHelloChange(previous: string, current: string) {
-        console.log(previous, 'jaaaan change ashxatum a');
-    }
 
     changeContent(): void {
         this.isButtonInVisible = !this.isButtonInVisible;
-        this.user.name = 'Vardanyan';
     }
 }
 
 @Component({
-    template: `<p>Paragpaph is nested!
-                <a on-click="greet()">Hi!
-                </a>
-                <span bind-innerText="greetText"></span>
-                <input type="text" bind-model="greetText"/>
-            </p>`,
+    template: `<p>Paragpaph is nested!</p>`,
     selector: 'nested'
 })
-class ParagraphComponent {
-    greetText = 'Hello, moto!'
+class NestedComponent {}
 
-    greet() {
-        alert('Hello!')
-    }
-
-}
-
-const mdl = new Module([Greeter, ParagraphComponent], document.getElementById('root'));
+const module = new Module([RootComponent, NestedComponent], document.getElementById('root'));
